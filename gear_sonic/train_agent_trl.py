@@ -25,6 +25,46 @@ if _script_dir in sys.path:
 if _repo_root not in sys.path:
     sys.path.insert(0, _repo_root)
 
+
+def _isolate_cuda_visible_device_per_rank() -> None:
+    """Expose only one physical GPU to each rank before Isaac/Kit imports."""
+
+    if os.environ.get("SONIC_ISOLATE_VISIBLE_DEVICE", "1") in {"0", "false", "False"}:
+        return
+
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if world_size <= 1:
+        return
+
+    original_local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    original_cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+    if original_cuda_visible_devices:
+        visible_devices = [device.strip() for device in original_cuda_visible_devices.split(",") if device.strip()]
+        if original_local_rank >= len(visible_devices):
+            raise RuntimeError(
+                f"LOCAL_RANK={original_local_rank} is outside CUDA_VISIBLE_DEVICES={original_cuda_visible_devices}"
+            )
+        selected_device = visible_devices[original_local_rank]
+    else:
+        selected_device = str(original_local_rank)
+
+    os.environ["SONIC_ORIGINAL_LOCAL_RANK"] = str(original_local_rank)
+    os.environ["SONIC_ORIGINAL_CUDA_VISIBLE_DEVICES"] = original_cuda_visible_devices or "<unset>"
+    os.environ["CUDA_VISIBLE_DEVICES"] = selected_device
+    # After masking, every process sees its assigned physical GPU as cuda:0.
+    os.environ["LOCAL_RANK"] = "0"
+    os.environ["SONIC_VISIBLE_DEVICE_ISOLATED"] = "1"
+    print(
+        "[SONIC] Isolated CUDA_VISIBLE_DEVICES for this rank: "
+        f"original_LOCAL_RANK={original_local_rank}, "
+        f"original_CUDA_VISIBLE_DEVICES={original_cuda_visible_devices or '<unset>'}, "
+        f"CUDA_VISIBLE_DEVICES={selected_device}, LOCAL_RANK=0",
+        flush=True,
+    )
+
+
+_isolate_cuda_visible_device_per_rank()
+
 try:
     import isaaclab  # noqa: F401
 except ImportError:
@@ -70,11 +110,54 @@ from gear_sonic.utils.obs_utils import get_group_term_obs_shape
 register_rl_resolvers()
 
 
+def _get_wandb_run_name(config) -> str:
+    configured_wandb_name = config.wandb.get("wandb_name", None)
+    if configured_wandb_name:
+        return str(configured_wandb_name)
+
+    return os.path.basename(os.path.normpath(str(config.experiment_dir)))
+
+
+def _get_wandb_mode_and_tags(config) -> tuple[str | None, list[str] | None]:
+    wandb_mode = config.wandb.get("wandb_mode", None)
+    wandb_tags = config.wandb.get("wandb_tags", None)
+
+    # Older configs used wandb_tags as online/offline/disabled mode.
+    if isinstance(wandb_tags, str) and wandb_tags in {"online", "offline", "disabled"}:
+        if wandb_mode is None:
+            wandb_mode = wandb_tags
+        wandb_tags = None
+
+    if wandb_mode is not None:
+        wandb_mode = str(wandb_mode)
+        if wandb_mode not in {"online", "offline", "disabled"}:
+            raise ValueError(f"Unsupported wandb mode: {wandb_mode}")
+
+    if wandb_tags is None:
+        return wandb_mode, None
+    if isinstance(wandb_tags, str):
+        return wandb_mode, [wandb_tags]
+    return wandb_mode, [str(tag) for tag in wandb_tags]
+
+
 def resume_training(config):
     if config.get("checkpoint", None) is not None:
         last_existing_checkpoint = config.checkpoint
+        config.checkpoint = last_existing_checkpoint
+        print(
+            "Resuming training from "
+            f"{last_existing_checkpoint}; saving new checkpoints to {config.experiment_dir}"
+        )
+        return
     elif config.get("experiment_dir", None) is not None:
         last_existing_checkpoint = os.path.join(config.experiment_dir, "last.pt")
+        if not os.path.exists(last_existing_checkpoint):
+            experiment_dir_base = re.sub(r"-\d{8}_\d{6}$", "", config.experiment_dir)
+            checkpoints = sorted(glob.glob(os.path.join(f"{experiment_dir_base}-*", "last.pt")))
+            if not checkpoints:
+                print(f"No checkpoint found matching {experiment_dir_base}-*/last.pt, starting fresh")
+                return
+            last_existing_checkpoint = checkpoints[-1]
     else:
         # Use experiment_dir to find the checkpoint, rather than reconstructing
         # from config.project_name which can differ from the actual filesystem path.
@@ -186,7 +269,10 @@ def main(config: OmegaConf):
         kwargs_handlers=[ddp_kwargs, kwargs],
     )
 
+    visible_device_isolated = os.environ.get("SONIC_VISIBLE_DEVICE_ISOLATED") == "1"
     device = str(accelerator.device)
+    if visible_device_isolated and device.startswith("cuda"):
+        device = "cuda:0"
     if device == "cuda":
         device = "cuda:0"
     config.multi_gpu = accelerator.num_processes > 1
@@ -205,23 +291,29 @@ def main(config: OmegaConf):
 
     unresolved_conf = OmegaConf.to_container(config, resolve=False)
     if config.use_wandb and accelerator.is_main_process:
-        project_name = f"{config.project_name}"
-        run_name = config.experiment_dir.replace(f"{config.base_dir}/{project_name}/", "")
+        project_name = str(config.wandb.get("wandb_project", None) or config.project_name)
+        run_name = _get_wandb_run_name(config)
+        wandb_mode, wandb_tags = _get_wandb_mode_and_tags(config)
         wandb_dir = Path(config.wandb.wandb_dir)
         wandb_dir.mkdir(exist_ok=True, parents=True)
         wandb_group = None if config.wandb.wandb_id is not None else config.wandb.wandb_group
         logger.info(f"Saving wandb logs to {wandb_dir}")
-        wandb.init(
-            project=project_name,
-            entity=config.wandb.wandb_entity,
-            name=run_name,
-            sync_tensorboard=True,
-            config=unresolved_conf,
-            dir=wandb_dir,
-            id=config.wandb.wandb_id,
-            group=wandb_group,
-            resume="allow",
-        )
+        wandb_init_kwargs = {
+            "project": project_name,
+            "entity": config.wandb.wandb_entity,
+            "name": run_name,
+            "sync_tensorboard": False,
+            "config": unresolved_conf,
+            "dir": wandb_dir,
+            "id": config.wandb.wandb_id,
+            "group": wandb_group,
+            "resume": "allow",
+        }
+        if wandb_mode is not None:
+            wandb_init_kwargs["mode"] = wandb_mode
+        if wandb_tags is not None:
+            wandb_init_kwargs["tags"] = wandb_tags
+        wandb.init(**wandb_init_kwargs)
 
     # Setup simulator similar to train_agent.py
 
@@ -261,13 +353,18 @@ def main(config: OmegaConf):
             or env_config.config.get("overview_camera", False)
         )
         args_cli.headless = config.headless
-        args_cli.multi_gpu = config.multi_gpu
-        args_cli.distributed = config.multi_gpu
+        args_cli.multi_gpu = config.multi_gpu and not visible_device_isolated
+        args_cli.distributed = config.multi_gpu and not visible_device_isolated
         args_cli.device = device
 
         # Base kit args (quiet logs)
+        original_local_rank = os.environ.get(
+            "SONIC_ORIGINAL_LOCAL_RANK", os.environ.get("LOCAL_RANK", "0")
+        )
+        original_global_rank = os.environ.get("RANK", "0")
         args_cli.kit_args = (
-            "--/log/level=error --/log/fileLogLevel=error --/log/outputStreamLevel=error"
+            "--/log/level=error --/log/fileLogLevel=error --/log/outputStreamLevel=error "
+            f"--portable-root /tmp/isaaclab_sonic_rank_{original_global_rank}_{original_local_rank}"
         )
 
         # AppLauncher can't handle multiple processes creating it at the same time so we need a lock

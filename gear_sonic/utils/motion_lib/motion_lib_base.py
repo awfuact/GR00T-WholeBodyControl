@@ -1130,14 +1130,25 @@ class MotionLibBase:
         except Exception as e:  # noqa: BLE001
             logger.warning(f"Could not increase file descriptor limit: {e}")
 
-        manager = mp.Manager()
-        queue = manager.Queue()
         num_jobs = min(min(mp.cpu_count(), 32), len(motion_data_list))  # noqa: PLW3301
 
         if num_jobs <= 8 or not self.multi_thread or len(motion_data_list) <= 128:
             num_jobs = 1
+        else:
+            configured_num_jobs = os.environ.get(
+                "SONIC_MOTION_LOAD_JOBS", self.m_cfg.get("num_load_jobs", None)
+            )
+            if configured_num_jobs is not None:
+                num_jobs = max(1, min(int(configured_num_jobs), len(motion_data_list)))
+            elif int(os.environ.get("WORLD_SIZE", "1")) > 1 and self.smpl_data is not None:
+                # Each worker returns many CPU tensors. In multi-rank SMPL training,
+                # sending those tensors through multiprocessing queues can exhaust
+                # the node-wide file table even when every process has a high ulimit.
+                num_jobs = 1
 
         logger.info(f"Loading motions with {num_jobs} jobs...")
+        manager = mp.Manager() if num_jobs > 1 else None
+        queue = manager.Queue() if manager is not None else None
         self.res_non_nav_dataset = {}
         res_acc = {}  # using dictionary ensures order of the results.
         workers = []
@@ -1324,6 +1335,9 @@ class MotionLibBase:
                 worker.join()
                 worker.close()
             workers = []
+
+        if manager is not None:
+            manager.shutdown()
 
         for f in progress.track(range(len(res_acc)), description="Processing motions..."):
             motion_file_data, curr_motion = res_acc[f]

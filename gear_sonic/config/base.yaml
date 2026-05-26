@@ -27,7 +27,7 @@ checkpoint: null
 project_name: TEST
 experiment_name: TEST
 
-base_dir: logs_rl
+base_dir: /mnt/ddn/hongjie/humanoid/logs_sonic/logs_rl
 timestamp: ${now:%Y%m%d_%H%M%S}
 experiment_dir: ${base_dir}/${project_name}/$${experiment_name}-${timestamp}
 save_dir: ${experiment_dir}/.hydra

@@ -4,9 +4,11 @@ use_wandb: True
 
 wandb:
   wandb_project: null
-  wandb_tags: 'online' # 'online' or 'offline' or 'disabled'
+  wandb_name: null
+  wandb_mode: online # online, offline, or disabled
+  wandb_tags: null
   wandb_group: null
   wandb_id: null
   wandb_entity: null
-  wandb_dir: '/tmp' # use /tmp so that it will automatically be cleaned up
+  wandb_dir: /mnt/ddn/hongjie/humanoid/wandb
   # wandb_dir: ${experiment_dir}/.wandb
