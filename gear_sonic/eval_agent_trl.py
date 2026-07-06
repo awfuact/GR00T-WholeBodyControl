@@ -13,6 +13,53 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+import sys
+
+
+def _isolate_cuda_visible_device_for_eval() -> None:
+    """Expose one physical GPU before Isaac/Kit imports."""
+
+    if os.environ.get("SONIC_ISOLATE_VISIBLE_DEVICE", "1") in {"0", "false", "False"}:
+        return
+
+    original_local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    original_cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+    if original_cuda_visible_devices:
+        visible_devices = [
+            device.strip() for device in original_cuda_visible_devices.split(",") if device.strip()
+        ]
+        if original_local_rank >= len(visible_devices):
+            raise RuntimeError(
+                f"LOCAL_RANK={original_local_rank} is outside CUDA_VISIBLE_DEVICES={original_cuda_visible_devices}"
+            )
+        selected_device = visible_devices[original_local_rank]
+    else:
+        selected_device = str(original_local_rank)
+
+    os.environ["SONIC_ORIGINAL_LOCAL_RANK"] = str(original_local_rank)
+    os.environ["SONIC_ORIGINAL_CUDA_VISIBLE_DEVICES"] = original_cuda_visible_devices or "<unset>"
+    os.environ["CUDA_VISIBLE_DEVICES"] = selected_device
+    is_distributed_env = (
+        "RANK" in os.environ
+        or int(os.environ.get("WORLD_SIZE", "1")) > 1
+        or "LOCAL_RANK" in os.environ
+    )
+    if is_distributed_env:
+        os.environ["LOCAL_RANK"] = "0"
+    os.environ["SONIC_VISIBLE_DEVICE_ISOLATED"] = "1"
+    local_rank_message = os.environ.get("LOCAL_RANK", "<unset>")
+    print(
+        "[SONIC] Isolated CUDA_VISIBLE_DEVICES for eval: "
+        f"original_LOCAL_RANK={original_local_rank}, "
+        f"original_CUDA_VISIBLE_DEVICES={original_cuda_visible_devices or '<unset>'}, "
+        f"CUDA_VISIBLE_DEVICES={selected_device}, LOCAL_RANK={local_rank_message}",
+        flush=True,
+    )
+
+
+_isolate_cuda_visible_device_for_eval()
+
 try:
     import isaaclab  # noqa: F401
 except ImportError:
@@ -27,15 +74,12 @@ except ImportError:
         "After installing, activate the Isaac Lab conda/venv environment\n"
         "before running this script.\n"
     )
-    import sys
     sys.exit(1)
 
 import filelock  # noqa: I001
 import json
-import os
 import shutil
 import subprocess
-import sys
 
 sys.path.append(os.getcwd())
 import logging
@@ -166,14 +210,18 @@ def main(override_config: omegaconf.OmegaConf):
     kwargs = accelerate.InitProcessGroupKwargs(timeout=dt.timedelta(seconds=6000))
     accelerator = accelerate.Accelerator(kwargs_handlers=[kwargs])
 
+    visible_device_isolated = os.environ.get("SONIC_VISIBLE_DEVICE_ISOLATED") == "1"
     device = str(accelerator.device)
+    if visible_device_isolated and device.startswith("cuda"):
+        device = "cuda:0"
+    if device == "cuda":
+        device = "cuda:0"
     if accelerator.device.type == "cuda":
         try:
-            torch.cuda.set_device(accelerator.local_process_index)
+            torch.cuda.set_device(0 if visible_device_isolated else accelerator.local_process_index)
         except Exception:  # noqa: S110, BLE001
             pass
 
-    device = str(accelerator.device)
     config.multi_gpu = accelerator.num_processes > 1
     if config.multi_gpu:
         config.global_rank = accelerator.process_index
@@ -228,15 +276,20 @@ def main(override_config: omegaconf.OmegaConf):
         ) or env_config.config.get("enable_cameras", False)
 
         args_cli.headless = config.headless
-        args_cli.multi_gpu = config.multi_gpu
-        args_cli.distributed = config.multi_gpu
+        args_cli.multi_gpu = config.multi_gpu and not visible_device_isolated
+        args_cli.distributed = config.multi_gpu and not visible_device_isolated
         args_cli.device = device
 
+        original_local_rank = os.environ.get(
+            "SONIC_ORIGINAL_LOCAL_RANK", os.environ.get("LOCAL_RANK", "0")
+        )
+        original_global_rank = os.environ.get("RANK", "0")
         base_kit_args = (
-            "--/log/level=error --/log/fileLogLevel=error --/log/outputStreamLevel=error"
+            "--/log/level=error --/log/fileLogLevel=error --/log/outputStreamLevel=error "
+            f"--portable-root /tmp/isaaclab_sonic_eval_rank_{original_global_rank}_{original_local_rank}"
         )
         if args_cli.headless:
-            args_cli.kit_args = base_kit_args + " --no-window"
+            args_cli.kit_args = base_kit_args
         else:
             args_cli.kit_args = base_kit_args + f" --/renderer/activeGpu={render_gpu_idx}"
 
